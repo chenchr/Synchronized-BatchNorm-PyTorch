@@ -16,67 +16,13 @@ import torch.nn.functional as F
 from torch.nn.modules.batchnorm import _BatchNorm
 from torch.nn.parallel._functions import ReduceAddCoalesced, Broadcast
 
-from .comm import SyncMaster
-from torch.autograd import Function
+from comm import SyncMaster
+from bn.bn import func_bn
+from sum_square.sum_square import func_sum_square
 
 __all__ = ['SynchronizedBatchNorm1d', 'SynchronizedBatchNorm2d', 'SynchronizedBatchNorm3d']
 
-class func_sum_square(Function):
-    def __init__(self):
-        super(func_sum_square, self).__init__()
 
-    def forward(self, fea):
-        '''
-        fea: n, c, num  3 dim tensor
-        '''
-        self.save_for_backward(fea)
-        sum, ssum = fea.sum(0).sum(-1), (fea ** 2).sum(0).sum(-1)
-
-        return sum, ssum
-
-    def backward(self, grad_sum, grad_ssum):
-
-        fea, = self.saved_tensors
-
-        grad_sum, grad_ssum = [x.unsqueeze(0).unsqueeze(-1) for x in [grad_sum, grad_ssum] ]
-        grad_in = grad_sum + 2 * fea * grad_ssum
-
-        return grad_in
-
-class func_bn(Function):
-    def __init__(self):
-        super(func_bn, self).__init__()
-
-    def forward(self, input, mean, inv_std, gamma, beta):
-        '''
-        input: n, c, num  3 dim tensor
-        '''
-        assert(gamma.nelement() > 0 and beta.nelement() > 0)
-        self.save_for_backward(input, mean, inv_std, gamma, beta)
-        mean, inv_std, gamma, beta = [x.view(1,-1,1) for x in [mean, inv_std, gamma, beta] ]
-        output = (input - mean) * inv_std * gamma + beta
-
-        return output
-
-    def backward(self, grad_out):
-        if not grad_out.is_cuda:
-            raise NotImplementedError
-
-        input, mean, inv_std, gamma, beta = self.saved_tensors
-
-        mean, inv_std, gamma, beta = [x.view(1,-1,1) for x in [mean, inv_std, gamma, beta] ]
-        sum_out = grad_out.sum(0,keepdim=True).sum(-1,keepdim=True)
-        sum_inout = (input * grad_out).sum(0,keepdim=True).sum(-1,keepdim=True)
-        scale = gamma * inv_std
-        grad_mean = - scale * sum_out
-        temp = sum_inout - mean * sum_out
-        grad_inv_std = gamma * temp
-        grad_gamma = inv_std * temp
-        grad_beta = sum_out
-        grad_in = grad_out * scale
-        grad_mean, grad_inv_std, grad_gamma, grad_beta = [x.view(-1) for x in [grad_mean, grad_inv_std, grad_gamma, grad_beta] ]
-
-        return grad_in, grad_mean, grad_inv_std, grad_gamma, grad_beta
 def _sum_ft(tensor):
     """sum over the first and last dimention"""
     return tensor.sum(dim=0).sum(dim=-1)
@@ -116,6 +62,7 @@ class _SynchronizedBatchNorm(_BatchNorm):
         sum_size = input.size(0) * input.size(2)
         #input_sum = _sum_ft(input)
         #input_ssum = _sum_ft(input ** 2)
+        # using custom op
         input_sum, input_ssum = func_sum_square()(input)
 
         # Reduce-and-broadcast the statistics.
@@ -183,7 +130,8 @@ class _SynchronizedBatchNorm(_BatchNorm):
         self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean.data
         self.running_var = (1 - self.momentum) * self.running_var + self.momentum * unbias_var.data
 
-        return mean, bias_var.clamp(self.eps) ** -0.5
+        #return mean, bias_var.clamp(self.eps) ** (-0.5)
+        return mean, (bias_var + self.eps) ** (-0.5)
 
 
 class SynchronizedBatchNorm1d(_SynchronizedBatchNorm):
